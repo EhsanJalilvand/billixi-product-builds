@@ -10,11 +10,20 @@ on:
       api_url:
         required: true
         type: string
+    secrets:
+      BILLIXI_SIGNING_SECRET_1:
+        required: false
+      BILLIXI_SIGNING_SECRET_2:
+        required: false
+      BILLIXI_SIGNING_SECRET_3:
+        required: false
+      BILLIXI_SIGNING_SECRET_4:
+        required: false
 permissions: {}
 jobs:
   prepare:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 360
     permissions:
       id-token: write
       contents: read
@@ -23,6 +32,7 @@ jobs:
       source: ${{ steps.prepare.outputs.source }}
       repository: ${{ steps.prepare.outputs.repository }}
       compact_id: ${{ steps.prepare.outputs.compact_id }}
+      maximum_file_bytes: ${{ steps.prepare.outputs.maximum_file_bytes }}
     steps:
       - id: prepare
         shell: python
@@ -34,39 +44,41 @@ jobs:
           attempt = uuid.UUID(os.environ['BUILD_ATTEMPT'])
           api = os.environ['BUILD_API']
           parsed = urllib.parse.urlparse(api)
-          if parsed.scheme != 'https' or parsed.hostname != 'api.billixi.com' or parsed.path != '/api/v1/payment/source-providers/github/builds' or parsed.query or parsed.username:
+          if parsed.scheme != 'https' or parsed.hostname != 'api.billixi.com' or parsed.port not in (None, 443) or parsed.path != '/api/v1/payment/source-providers/github/builds' or parsed.query or parsed.fragment or parsed.username or parsed.password:
               raise RuntimeError('Invalid Billixi endpoint')
           audience = f'billixi-build:{attempt.hex}:prepare'
-          request = urllib.request.Request(os.environ['ACTIONS_ID_TOKEN_REQUEST_URL'] + '&audience=' + urllib.parse.quote(audience, safe=''),
-              headers={'Authorization': 'Bearer ' + os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']})
-          with urllib.request.urlopen(request, timeout=30) as response:
-              token = json.load(response)['value']
-          print('::add-mask::' + token)
-          request = urllib.request.Request(f'{api}/{attempt}/prepare', data=b'{}', method='POST',
-              headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'})
-          for retry in range(3):
+          callback_url = f'{api}/{attempt}/prepare'
+          body = b'{}'
+          for retry in range(12):
               try:
-                  with urllib.request.urlopen(request, timeout=60) as response:
-                      preparation = json.load(response)['data']
+                  token_request = urllib.request.Request(os.environ['ACTIONS_ID_TOKEN_REQUEST_URL'] + '&audience=' + urllib.parse.quote(audience, safe=''),
+                      headers={'Authorization': 'Bearer ' + os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']})
+                  with urllib.request.urlopen(token_request, timeout=30) as response: token = json.load(response)['value']
+                  print('::add-mask::' + token)
+                  request = urllib.request.Request(callback_url, data=body, method='POST',
+                      headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'})
+                  with urllib.request.urlopen(request, timeout=60) as response: result = json.load(response)['data']
                   break
               except urllib.error.HTTPError as error:
                   ray = error.headers.get('CF-Ray', '')
                   ray = ray if len(ray) <= 80 and re.fullmatch(r'[0-9a-fA-F-]+(?:[A-Z]{3})?', ray) else 'unavailable'
-                  print(f'::error::Billixi prepare callback returned HTTP {error.code}; CF-Ray={ray}. Check Billixi ingress and runner authorization.')
-                  if error.code not in (408, 429) and error.code < 500: raise
-                  if retry == 2: raise
-                  time.sleep(5 * (retry + 1))
-              except Exception:
-                  if retry == 2: raise
-                  time.sleep(5 * (retry + 1))
+                  transient = error.code in (408, 429) or error.code >= 500
+                  annotation = 'warning' if transient else 'error'
+                  print(f'::{annotation}::Billixi callback returned HTTP {error.code}; CF-Ray={ray}. Check Billixi ingress and runner authorization.')
+                  if not transient or retry == 11: raise
+                  time.sleep(min(30, 5 * (retry + 1)))
+              except (OSError, TimeoutError):
+                  if retry == 11: raise
+                  time.sleep(min(30, 5 * (retry + 1)))
+          preparation = result
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
               for key, value in {'recipe': json.dumps(preparation['recipe'], separators=(',', ':')), 'source': preparation['sourceCommit'],
-                  'repository': preparation['repository'], 'compact_id': attempt.hex}.items():
-                  output.write(key + '=' + value + '\n')
+                  'repository': preparation['repository'], 'compact_id': attempt.hex, 'maximum_file_bytes': preparation['maximumFileBytes']}.items():
+                  output.write(key + '=' + str(value) + '\n')
   build:
     needs: prepare
     runs-on: ${{ fromJSON(needs.prepare.outputs.recipe).runner }}
-    timeout-minutes: 45
+    timeout-minutes: 360
     permissions:
       contents: read
     outputs:
@@ -77,6 +89,8 @@ jobs:
           repository: ${{ needs.prepare.outputs.repository }}
           ref: ${{ needs.prepare.outputs.source }}
           persist-credentials: false
+          submodules: ${{ fromJSON(needs.prepare.outputs.recipe).submodules && 'recursive' || 'false' }}
+          lfs: ${{ fromJSON(needs.prepare.outputs.recipe).lfs || false }}
       - if: ${{ fromJSON(needs.prepare.outputs.recipe).runtime == 'node' }}
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
@@ -87,54 +101,92 @@ jobs:
           dotnet-version: ${{ fromJSON(needs.prepare.outputs.recipe).toolVersion }}
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
-          python-version: ${{ fromJSON(needs.prepare.outputs.recipe).runtime == 'python' && fromJSON(needs.prepare.outputs.recipe).toolVersion || '3.12' }}
+          python-version: ${{ (fromJSON(needs.prepare.outputs.recipe).runtime == 'python' || fromJSON(needs.prepare.outputs.recipe).runtime == 'custom' || fromJSON(needs.prepare.outputs.recipe).runtime == 'static') && fromJSON(needs.prepare.outputs.recipe).toolVersion || '3.12' }}
       - name: Build selected source
         shell: python
         env:
           BUILD_RECIPE: ${{ needs.prepare.outputs.recipe }}
+          BILLIXI_SIGNING_SECRET_1: ${{ secrets.BILLIXI_SIGNING_SECRET_1 }}
+          BILLIXI_SIGNING_SECRET_2: ${{ secrets.BILLIXI_SIGNING_SECRET_2 }}
+          BILLIXI_SIGNING_SECRET_3: ${{ secrets.BILLIXI_SIGNING_SECRET_3 }}
+          BILLIXI_SIGNING_SECRET_4: ${{ secrets.BILLIXI_SIGNING_SECRET_4 }}
         run: |
           import json, os, pathlib, subprocess
           recipe = json.loads(os.environ['BUILD_RECIPE'])
           root = pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve()
           work = (root / recipe['workingDirectory']).resolve()
           if work != root and root not in work.parents: raise RuntimeError('Invalid working directory')
-          subprocess.run(recipe['buildCommand'], shell=True, check=True, cwd=work)
+          shell = recipe.get('shell', 'auto')
+          if shell == 'auto': shell = 'cmd' if os.name == 'nt' else 'bash'
+          commands = {'cmd': ['cmd', '/d', '/s', '/c'], 'bash': ['bash', '-e', '-o', 'pipefail', '-c'],
+              'pwsh': ['pwsh', '-NoLogo', '-NoProfile', '-NonInteractive', '-Command']}
+          if shell not in commands: raise RuntimeError('Unsupported build shell')
+          command = recipe['buildCommand']
+          if shell == 'pwsh': command = "$ErrorActionPreference = 'Stop'; " + command + "; if ($LASTEXITCODE) { exit $LASTEXITCODE }"
+          subprocess.run(commands[shell] + [command], check=True, cwd=work)
       - name: Package final file
         shell: python
         env:
           BUILD_RECIPE: ${{ needs.prepare.outputs.recipe }}
+          BUILD_MAXIMUM_FILE_BYTES: ${{ needs.prepare.outputs.maximum_file_bytes }}
         run: |
-          import json, os, pathlib, shutil, zipfile
+          import json, os, pathlib, shutil, subprocess, sys, tarfile, zipfile
           recipe = json.loads(os.environ['BUILD_RECIPE'])
           root = pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve()
-          source = (root / recipe['workingDirectory'] / recipe['outputPath']).resolve()
-          if root not in source.parents or not source.exists(): raise RuntimeError('Output path is missing or outside the project')
+          raw = root / recipe['workingDirectory'] / recipe['outputPath']
+          source = raw.resolve()
+          if raw.is_symlink() or root not in source.parents or not source.exists():
+              raise RuntimeError('Output path is missing, a symlink, or outside the project')
+          if source.name in ('.', '..') or any(ord(c) < 32 or ord(c) == 127 for c in source.name):
+              raise RuntimeError('Invalid output filename')
           target = pathlib.Path(os.environ['RUNNER_TEMP']) / 'billixi-payload'
           target.mkdir(exist_ok=False)
           if source.is_file():
-              shutil.copyfile(source, target / source.name)
+              # Preserve exact bytes of the installable/archive selected by the recipe.
+              # Bare Unix executables need a tar wrapper to retain executable permissions.
+              if os.name != 'nt' and source.stat().st_mode & 0o111 and source.suffix.lower() not in ('.zip', '.gz', '.xz', '.bz2', '.7z', '.rar', '.exe', '.msi', '.msix', '.apk', '.aab', '.ipa', '.dmg', '.pkg', '.deb', '.rpm'):
+                  with tarfile.open(target / (source.name + '.tar.gz'), 'w:gz') as archive:
+                      archive.add(source, arcname=source.name)
+              else:
+                  shutil.copyfile(source, target / source.name)
           else:
-              with zipfile.ZipFile(target / 'product.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
-                  count = 0
-                  for path in sorted(source.rglob('*')):
-                      if path.is_symlink(): raise RuntimeError('Symlinks are not supported in build output')
-                      if '.git' in path.parts: continue
-                      if path.is_file():
+              paths = list(source.rglob('*'))
+              if not any(path.is_file() for path in paths): raise RuntimeError('Build output is empty')
+              for path in paths:
+                  if not (path.is_file() or path.is_dir() or path.is_symlink()):
+                      raise RuntimeError('Special files are not supported in build output')
+                  if path.is_symlink() and (pathlib.Path(os.readlink(path)).is_absolute() or not path.exists() or source not in path.resolve().parents):
+                      raise RuntimeError('Output symlink must stay inside the selected output folder')
+              if source.suffix.lower() == '.app':
+                  if sys.platform != 'darwin': raise RuntimeError('Package .app bundles on macOS or select a finished ZIP/DMG/PKG')
+                  subprocess.run(['ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(source), str(target / (source.name + '.zip'))], check=True)
+              elif recipe['runtime'] != 'static' and os.name != 'nt':
+                  with tarfile.open(target / 'product.tar.gz', 'w:gz', dereference=False) as archive:
+                      for path in sorted(source.iterdir()):
+                          if path.name != '.git': archive.add(path, arcname=path.name, filter=lambda entry: None if '.git' in pathlib.PurePosixPath(entry.name).parts else entry)
+              else:
+                  with zipfile.ZipFile(target / 'product.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
+                      for path in sorted(paths):
+                          if '.git' in path.relative_to(source).parts: continue
+                          if path.is_symlink(): raise RuntimeError('Select a finished archive to preserve symlinks')
                           archive.write(path, path.relative_to(source).as_posix())
-                          count += 1
-                  if count == 0: raise RuntimeError('Build output is empty')
+          payload = next(target.iterdir())
+          if len(payload.name) > 200 or any(ord(c) < 32 or ord(c) == 127 for c in payload.name):
+              raise RuntimeError('Invalid final filename')
+          if payload.stat().st_size <= 0 or payload.stat().st_size > int(os.environ['BUILD_MAXIMUM_FILE_BYTES']):
+              raise RuntimeError('Final file exceeds the Billixi file size limit; reduce it before uploading')
       - id: upload
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: billixi-${{ needs.prepare.outputs.compact_id }}
           path: ${{ runner.temp }}/billixi-payload/*
           if-no-files-found: error
-          retention-days: 2
+          include-hidden-files: true
           compression-level: 0
   finalize:
     needs: [prepare, build]
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 360
     permissions:
       actions: read
       id-token: write
@@ -158,25 +210,27 @@ jobs:
           file = files[0]
           with file.open('rb') as stream: digest = hashlib.file_digest(stream, 'sha256').hexdigest()
           audience = f'billixi-build:{attempt.hex}:complete:{digest}'
-          request = urllib.request.Request(os.environ['ACTIONS_ID_TOKEN_REQUEST_URL'] + '&audience=' + urllib.parse.quote(audience, safe=''),
-              headers={'Authorization': 'Bearer ' + os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']})
-          with urllib.request.urlopen(request, timeout=30) as response: token = json.load(response)['value']
-          print('::add-mask::' + token)
+          callback_url = f"{os.environ['BUILD_API']}/{attempt}/complete"
           body = json.dumps({'sha256': digest, 'sizeBytes': file.stat().st_size, 'fileName': file.name,
               'artifactId': int(os.environ['BUILD_ARTIFACT_ID'])}).encode()
-          request = urllib.request.Request(f"{os.environ['BUILD_API']}/{attempt}/complete", data=body, method='POST',
-              headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'})
-          for retry in range(4):
+          for retry in range(12):
               try:
-                  with urllib.request.urlopen(request, timeout=60) as response: json.load(response)
+                  token_request = urllib.request.Request(os.environ['ACTIONS_ID_TOKEN_REQUEST_URL'] + '&audience=' + urllib.parse.quote(audience, safe=''),
+                      headers={'Authorization': 'Bearer ' + os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']})
+                  with urllib.request.urlopen(token_request, timeout=30) as response: token = json.load(response)['value']
+                  print('::add-mask::' + token)
+                  request = urllib.request.Request(callback_url, data=body, method='POST',
+                      headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'})
+                  with urllib.request.urlopen(request, timeout=60) as response: result = json.load(response)['data']
                   break
               except urllib.error.HTTPError as error:
                   ray = error.headers.get('CF-Ray', '')
                   ray = ray if len(ray) <= 80 and re.fullmatch(r'[0-9a-fA-F-]+(?:[A-Z]{3})?', ray) else 'unavailable'
-                  print(f'::error::Billixi complete callback returned HTTP {error.code}; CF-Ray={ray}. Check Billixi ingress and runner authorization.')
-                  if error.code not in (408, 429) and error.code < 500: raise
-                  if retry == 3: raise
-                  time.sleep(5 * (retry + 1))
-              except Exception:
-                  if retry == 3: raise
-                  time.sleep(5 * (retry + 1))
+                  transient = error.code in (408, 429) or error.code >= 500
+                  annotation = 'warning' if transient else 'error'
+                  print(f'::{annotation}::Billixi callback returned HTTP {error.code}; CF-Ray={ray}. Check Billixi ingress and runner authorization.')
+                  if not transient or retry == 11: raise
+                  time.sleep(min(30, 5 * (retry + 1)))
+              except (OSError, TimeoutError):
+                  if retry == 11: raise
+                  time.sleep(min(30, 5 * (retry + 1)))
