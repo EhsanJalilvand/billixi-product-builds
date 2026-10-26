@@ -30,7 +30,7 @@ jobs:
           BUILD_ATTEMPT: ${{ inputs.attempt_id }}
           BUILD_API: ${{ inputs.api_url }}
         run: |
-          import json, os, time, urllib.request, urllib.parse, uuid
+          import json, os, time, urllib.request, urllib.parse, urllib.error, uuid, re
           attempt = uuid.UUID(os.environ['BUILD_ATTEMPT'])
           api = os.environ['BUILD_API']
           parsed = urllib.parse.urlparse(api)
@@ -49,6 +49,13 @@ jobs:
                   with urllib.request.urlopen(request, timeout=60) as response:
                       preparation = json.load(response)['data']
                   break
+              except urllib.error.HTTPError as error:
+                  ray = error.headers.get('CF-Ray', '')
+                  ray = ray if len(ray) <= 80 and re.fullmatch(r'[0-9a-fA-F-]+(?:[A-Z]{3})?', ray) else 'unavailable'
+                  print(f'::error::Billixi prepare callback returned HTTP {error.code}; CF-Ray={ray}. Check Billixi ingress and runner authorization.')
+                  if error.code not in (408, 429) and error.code < 500: raise
+                  if retry == 2: raise
+                  time.sleep(5 * (retry + 1))
               except Exception:
                   if retry == 2: raise
                   time.sleep(5 * (retry + 1))
@@ -144,7 +151,7 @@ jobs:
           BUILD_API: ${{ inputs.api_url }}
           BUILD_ARTIFACT_ID: ${{ needs.build.outputs.artifact_id }}
         run: |
-          import hashlib, json, os, pathlib, time, urllib.request, urllib.parse, uuid
+          import hashlib, json, os, pathlib, time, urllib.request, urllib.parse, urllib.error, uuid, re
           attempt = uuid.UUID(os.environ['BUILD_ATTEMPT'])
           files = list((pathlib.Path(os.environ['RUNNER_TEMP']) / 'billixi-final').iterdir())
           if len(files) != 1 or not files[0].is_file() or files[0].is_symlink(): raise RuntimeError('Exactly one final file is required')
@@ -163,6 +170,13 @@ jobs:
               try:
                   with urllib.request.urlopen(request, timeout=60) as response: json.load(response)
                   break
+              except urllib.error.HTTPError as error:
+                  ray = error.headers.get('CF-Ray', '')
+                  ray = ray if len(ray) <= 80 and re.fullmatch(r'[0-9a-fA-F-]+(?:[A-Z]{3})?', ray) else 'unavailable'
+                  print(f'::error::Billixi complete callback returned HTTP {error.code}; CF-Ray={ray}. Check Billixi ingress and runner authorization.')
+                  if error.code not in (408, 429) and error.code < 500: raise
+                  if retry == 3: raise
+                  time.sleep(5 * (retry + 1))
               except Exception:
                   if retry == 3: raise
                   time.sleep(5 * (retry + 1))
