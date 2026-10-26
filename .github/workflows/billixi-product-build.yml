@@ -1,0 +1,168 @@
+# Publish this reviewed reusable workflow from a public Billixi-owned repository.
+# Configure ManagedBuildWorkflowRef and ManagedBuildWorkflowSha to its exact commit.
+name: Billixi managed product build
+on:
+  workflow_call:
+    inputs:
+      attempt_id:
+        required: true
+        type: string
+      api_url:
+        required: true
+        type: string
+permissions: {}
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      recipe: ${{ steps.prepare.outputs.recipe }}
+      source: ${{ steps.prepare.outputs.source }}
+      repository: ${{ steps.prepare.outputs.repository }}
+      compact_id: ${{ steps.prepare.outputs.compact_id }}
+    steps:
+      - id: prepare
+        shell: python
+        env:
+          BUILD_ATTEMPT: ${{ inputs.attempt_id }}
+          BUILD_API: ${{ inputs.api_url }}
+        run: |
+          import json, os, time, urllib.request, urllib.parse, uuid
+          attempt = uuid.UUID(os.environ['BUILD_ATTEMPT'])
+          api = os.environ['BUILD_API']
+          parsed = urllib.parse.urlparse(api)
+          if parsed.scheme != 'https' or parsed.hostname != 'api.billixi.com' or parsed.path != '/api/v1/payment/source-providers/github/builds' or parsed.query or parsed.username:
+              raise RuntimeError('Invalid Billixi endpoint')
+          audience = f'billixi-build:{attempt.hex}:prepare'
+          request = urllib.request.Request(os.environ['ACTIONS_ID_TOKEN_REQUEST_URL'] + '&audience=' + urllib.parse.quote(audience, safe=''),
+              headers={'Authorization': 'Bearer ' + os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']})
+          with urllib.request.urlopen(request, timeout=30) as response:
+              token = json.load(response)['value']
+          print('::add-mask::' + token)
+          request = urllib.request.Request(f'{api}/{attempt}/prepare', data=b'{}', method='POST',
+              headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'})
+          for retry in range(3):
+              try:
+                  with urllib.request.urlopen(request, timeout=60) as response:
+                      preparation = json.load(response)['data']
+                  break
+              except Exception:
+                  if retry == 2: raise
+                  time.sleep(5 * (retry + 1))
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              for key, value in {'recipe': json.dumps(preparation['recipe'], separators=(',', ':')), 'source': preparation['sourceCommit'],
+                  'repository': preparation['repository'], 'compact_id': attempt.hex}.items():
+                  output.write(key + '=' + value + '\n')
+  build:
+    needs: prepare
+    runs-on: ${{ fromJSON(needs.prepare.outputs.recipe).runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: ${{ needs.prepare.outputs.repository }}
+          ref: ${{ needs.prepare.outputs.source }}
+          persist-credentials: false
+      - if: ${{ fromJSON(needs.prepare.outputs.recipe).runtime == 'node' }}
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: ${{ fromJSON(needs.prepare.outputs.recipe).toolVersion }}
+      - if: ${{ fromJSON(needs.prepare.outputs.recipe).runtime == 'dotnet' }}
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68
+        with:
+          dotnet-version: ${{ fromJSON(needs.prepare.outputs.recipe).toolVersion }}
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: ${{ fromJSON(needs.prepare.outputs.recipe).runtime == 'python' && fromJSON(needs.prepare.outputs.recipe).toolVersion || '3.12' }}
+      - name: Build selected source
+        shell: python
+        env:
+          BUILD_RECIPE: ${{ needs.prepare.outputs.recipe }}
+        run: |
+          import json, os, pathlib, subprocess
+          recipe = json.loads(os.environ['BUILD_RECIPE'])
+          root = pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          work = (root / recipe['workingDirectory']).resolve()
+          if work != root and root not in work.parents: raise RuntimeError('Invalid working directory')
+          subprocess.run(recipe['buildCommand'], shell=True, check=True, cwd=work)
+      - name: Package final file
+        shell: python
+        env:
+          BUILD_RECIPE: ${{ needs.prepare.outputs.recipe }}
+        run: |
+          import json, os, pathlib, shutil, zipfile
+          recipe = json.loads(os.environ['BUILD_RECIPE'])
+          root = pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          source = (root / recipe['workingDirectory'] / recipe['outputPath']).resolve()
+          if root not in source.parents or not source.exists(): raise RuntimeError('Output path is missing or outside the project')
+          target = pathlib.Path(os.environ['RUNNER_TEMP']) / 'billixi-payload'
+          target.mkdir(exist_ok=False)
+          if source.is_file():
+              shutil.copyfile(source, target / source.name)
+          else:
+              with zipfile.ZipFile(target / 'product.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
+                  count = 0
+                  for path in sorted(source.rglob('*')):
+                      if path.is_symlink(): raise RuntimeError('Symlinks are not supported in build output')
+                      if '.git' in path.parts: continue
+                      if path.is_file():
+                          archive.write(path, path.relative_to(source).as_posix())
+                          count += 1
+                  if count == 0: raise RuntimeError('Build output is empty')
+      - id: upload
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: billixi-${{ needs.prepare.outputs.compact_id }}
+          path: ${{ runner.temp }}/billixi-payload/*
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+  finalize:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      id-token: write
+    steps:
+      # This fresh runner never checks out or executes seller code.
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          path: ${{ runner.temp }}/billixi-final
+      - name: Register exact output
+        shell: python
+        env:
+          BUILD_ATTEMPT: ${{ inputs.attempt_id }}
+          BUILD_API: ${{ inputs.api_url }}
+          BUILD_ARTIFACT_ID: ${{ needs.build.outputs.artifact_id }}
+        run: |
+          import hashlib, json, os, pathlib, time, urllib.request, urllib.parse, uuid
+          attempt = uuid.UUID(os.environ['BUILD_ATTEMPT'])
+          files = list((pathlib.Path(os.environ['RUNNER_TEMP']) / 'billixi-final').iterdir())
+          if len(files) != 1 or not files[0].is_file() or files[0].is_symlink(): raise RuntimeError('Exactly one final file is required')
+          file = files[0]
+          with file.open('rb') as stream: digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+          audience = f'billixi-build:{attempt.hex}:complete:{digest}'
+          request = urllib.request.Request(os.environ['ACTIONS_ID_TOKEN_REQUEST_URL'] + '&audience=' + urllib.parse.quote(audience, safe=''),
+              headers={'Authorization': 'Bearer ' + os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']})
+          with urllib.request.urlopen(request, timeout=30) as response: token = json.load(response)['value']
+          print('::add-mask::' + token)
+          body = json.dumps({'sha256': digest, 'sizeBytes': file.stat().st_size, 'fileName': file.name,
+              'artifactId': int(os.environ['BUILD_ARTIFACT_ID'])}).encode()
+          request = urllib.request.Request(f"{os.environ['BUILD_API']}/{attempt}/complete", data=body, method='POST',
+              headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'})
+          for retry in range(4):
+              try:
+                  with urllib.request.urlopen(request, timeout=60) as response: json.load(response)
+                  break
+              except Exception:
+                  if retry == 3: raise
+                  time.sleep(5 * (retry + 1))
